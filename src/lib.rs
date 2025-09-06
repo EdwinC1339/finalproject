@@ -1,24 +1,67 @@
 pub mod http;
+pub mod threadpool;
 
 use std::{
-    fs,
-    io::{prelude::*, BufReader},
-    net::{TcpListener, TcpStream}, thread, time::Duration,
+    collections::HashMap, fs, io::{self, prelude::*, BufReader}, net::{TcpListener, TcpStream}, sync::mpsc::{self, TryRecvError}, thread, time::Duration
 };
 use http::{HTTPRequest, HTTPResponse};
+use threadpool::ThreadPool;
 
 pub fn run() {
     let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
 
+    let (tx, rx) = mpsc::channel();
+
+    let dispatcher_handle = thread::spawn(move || dispatcher(rx));
+
     for stream in listener.incoming() {
         let stream = stream.unwrap();
+        tx.send(stream).expect("Couldn't send connection to dispatcher");
+    }
 
-        handle_connection(stream);
+    dispatcher_handle.join().unwrap();
+}
+
+fn dispatcher(rx: mpsc::Receiver<TcpStream>) {
+    let mut pending_connections = HashMap::new();
+    let mut thread_pool = ThreadPool::<HTTPRequest, HTTPResponse>::new(
+        8,
+        |req| respond(req)
+    );
+
+    let mut active_jobs = 0;
+
+    loop {
+        if active_jobs > 0 {
+            match rx.try_recv() {
+                Ok(stream) => {
+                    let Some(key) = start_connection(&stream, &mut thread_pool) else { continue };
+                    pending_connections.insert(key, stream);
+                    active_jobs += 1;
+                },
+                Err(e) if e == TryRecvError::Empty => (),
+                Err(_) => panic!("Socket closed")
+            }
+        } else {
+            let stream = rx.recv().expect("Socket closed");
+            let Some(key) = start_connection(&stream, &mut thread_pool) else { continue };
+            pending_connections.insert(key, stream);
+            active_jobs += 1;
+        }
+        
+        for (key, res) in thread_pool.poll() {
+            let mut stream = pending_connections.remove(&key).expect("Invalid key");
+            stream.write_all(res.to_string().as_bytes()).unwrap();
+            active_jobs -= 1;
+        }
     }
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    let buf_reader = BufReader::new(&stream);
+fn start_connection(
+    stream: &TcpStream, 
+    thread_pool: &mut ThreadPool<HTTPRequest, HTTPResponse>
+) -> Option<u32> {
+    let buf_reader = BufReader::new(stream);
     let http_request = buf_reader
         .lines()
         .map(|result| result.unwrap())
@@ -26,12 +69,10 @@ fn handle_connection(mut stream: TcpStream) {
 
     let Some(http_request) = HTTPRequest::new(http_request) else {
         eprintln!("Malformed request");
-        return;
+        return None;
     };
 
-    let response = respond(http_request);
-    
-    stream.write_all(response.to_string().as_bytes()).unwrap();
+    Some(thread_pool.submit(http_request))
 }
 
 fn respond(req: HTTPRequest) -> HTTPResponse {
@@ -42,7 +83,7 @@ fn respond(req: HTTPRequest) -> HTTPResponse {
             HTTPResponse::new(status, Vec::new().iter(), contents).unwrap()
         }
         "/wait" => {
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(10));
             let status = "200 OK";
             let contents = fs::read_to_string("src/hello.html").unwrap();
             HTTPResponse::new(status, Vec::new().iter(), contents).unwrap()
